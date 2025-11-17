@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# ChromaDB
+memory_db/
+
+# Models (large files)
+models/*.onnx
+models/*.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Frontend
+node_modules/
+.svelte-kit/
+build/
+.env
+.env.local
+
+# Temporary files
+*.tmp
+tmp*
+temp/
