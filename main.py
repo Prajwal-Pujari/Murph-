@@ -1,4 +1,3 @@
-# main.py (OPTIMIZED with Smart Token Generation)
 import asyncio
 import json
 import aiohttp
@@ -23,6 +22,9 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor
 import queue
 
+import winreg
+import psutil
+
 from piper.voice import PiperVoice
 from gtts import gTTS
 from pytube import Search
@@ -42,7 +44,6 @@ from selenium.webdriver.chrome.options import Options
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
-import time
 
 # --- Global State & Lifespan ---
 ml_models = {}
@@ -50,6 +51,7 @@ browser_driver = None
 current_humor_level = 85
 tts_executor = ThreadPoolExecutor(max_workers=2)
 audio_cache = {}
+active_tabs = {'media': None, 'search': None}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -126,6 +128,104 @@ MODEL_NAME = "llama3.1:8b-instruct-q4_K_M"
 OLLAMA_TIMEOUT = 120
 
 
+# --- FAST-PATH REGEX DETECTION (NEW) ---
+FAST_PATH_PATTERNS = {
+    'time': r'\b(what|tell me|what\'s|whats)\s+(time|the time)\b',
+    'pause': r'\b(pause|stop)\s+(video|it|playback)\b',
+    'play_video': r'\b(play|resume)\s+(video|it|playback)\b',
+    'mute': r'\bmute\b',
+    'unmute': r'\bunmute\b',
+    'volume_up': r'\b(volume\s+up|louder|increase\s+volume)\b',
+    'volume_down': r'\b(volume\s+down|quieter|decrease\s+volume)\b',
+    'youtube_play': r'\bplay\s+(.+?)\s+(?:on\s+)?youtube\b',
+    'youtube_search': r'\bsearch\s+(?:for\s+)?(.+?)\s+on\s+youtube\b',
+    'open_website': r'\bopen\s+(?:website\s+)?(.+\.(?:com|org|net|io|co|gov|edu))\b',
+    'navigate': r'\b(?:go to|navigate to)\s+(.+\.(?:com|org|net|io|co))\b',
+    'weather': r'\b(?:weather|temperature)\s+(?:in\s+)?(\w+)\b',
+    'next_video': r'\b(?:play\s+)?next\s+video\b',
+    'scroll_down': r'\bscroll\s+down\b',
+    'scroll_up': r'\bscroll\s+up\b',
+    'read_page': r'\b(?:read|what\'s on)\s+(?:the\s+)?page\b',
+    'close_tab': r'\bclose\s+(?:this\s+)?tab\b',
+    'list_apps': r'\b(?:list|show|what)\s+(?:available\s+)?(?:apps|applications|programs)\b',
+    'open_app': r'\bopen\s+([a-zA-Z0-9\s]+?)(?:\s+and|\s+then|$)',
+}
+
+def detect_fast_path(prompt: str):
+    """Returns (tool_name, params) if fast-path detected, else (None, None)"""
+    prompt_lower = prompt.lower()
+    
+    # Time
+    if re.search(FAST_PATH_PATTERNS['time'], prompt_lower):
+        return ('get_current_time', {})
+    
+    # Video controls
+    if re.search(FAST_PATH_PATTERNS['pause'], prompt_lower):
+        return ('control_video', {'action': 'pause'})
+    
+    if re.search(FAST_PATH_PATTERNS['play_video'], prompt_lower):
+        return ('control_video', {'action': 'play'})
+    
+    if re.search(FAST_PATH_PATTERNS['mute'], prompt_lower):
+        return ('control_video', {'action': 'mute'})
+    
+    if re.search(FAST_PATH_PATTERNS['unmute'], prompt_lower):
+        return ('control_video', {'action': 'unmute'})
+    
+    if re.search(FAST_PATH_PATTERNS['volume_up'], prompt_lower):
+        return ('control_video', {'action': 'volume_up'})
+    
+    if re.search(FAST_PATH_PATTERNS['volume_down'], prompt_lower):
+        return ('control_video', {'action': 'volume_down'})
+    
+    # YouTube
+    match = re.search(FAST_PATH_PATTERNS['youtube_play'], prompt_lower)
+    if match:
+        query = match.group(1).strip()
+        return ('play_youtube_video', {'query': query})
+    
+    match = re.search(FAST_PATH_PATTERNS['youtube_search'], prompt_lower)
+    if match:
+        query = match.group(1).strip()
+        return ('search_youtube', {'query': query})
+    
+    # Next video
+    if re.search(FAST_PATH_PATTERNS['next_video'], prompt_lower):
+        return ('play_next_video', {})
+    
+    # Website navigation
+    match = re.search(FAST_PATH_PATTERNS['open_website'], prompt_lower)
+    if match:
+        url = match.group(1).strip()
+        return ('navigate_to_url', {'url': url})
+    
+    match = re.search(FAST_PATH_PATTERNS['navigate'], prompt_lower)
+    if match:
+        url = match.group(1).strip()
+        return ('navigate_to_url', {'url': url})
+    
+    # Weather
+    match = re.search(FAST_PATH_PATTERNS['weather'], prompt_lower)
+    if match:
+        city = match.group(1).strip()
+        return ('get_weather', {'city': city})
+    
+    # Page controls
+    if re.search(FAST_PATH_PATTERNS['scroll_down'], prompt_lower):
+        return ('scroll_page', {'direction': 'down', 'amount': 'medium'})
+    
+    if re.search(FAST_PATH_PATTERNS['scroll_up'], prompt_lower):
+        return ('scroll_page', {'direction': 'up', 'amount': 'medium'})
+    
+    if re.search(FAST_PATH_PATTERNS['read_page'], prompt_lower):
+        return ('read_page_content', {})
+    
+    if re.search(FAST_PATH_PATTERNS['close_tab'], prompt_lower):
+        return ('close_current_tab', {})
+    
+    return (None, None)
+
+
 # --- Hybrid TTS Logic (OPTIMIZED) ---
 def is_online(host="8.8.8.8", port=53, timeout=2):
     try:
@@ -135,7 +235,6 @@ def is_online(host="8.8.8.8", port=53, timeout=2):
     except socket.error as ex:
         return False
 
-# --- OPTIMIZED TTS FUNCTION ---
 async def convert_text_to_audio_bytes(text: str) -> bytes:
     """OPTIMIZED: Faster TTS with caching and parallel processing"""
     
@@ -279,30 +378,26 @@ def parse_history_document(doc_string: str):
     
 
 def search_website(query: str, website_name: str):
-    print(f"Executing search_website: query={query}, website={website_name}")
+    """OPTIMIZED: Faster search navigation."""
+    print(f"Executing search_website: {query} on {website_name}")
     
-    search_url_templates = {
+    search_urls = {
         "wikipedia": "https://en.wikipedia.org/w/index.php?search=",
         "google": "https://www.google.com/search?q=",
         "youtube": "https://www.youtube.com/results?search_query=",
     }
     
-    url_query = query.replace(' ', '+')
     site_key = website_name.lower().strip()
-    
-    if site_key in search_url_templates:
-        url = search_url_templates[site_key] + url_query
-        result_msg = f"Searching {website_name} for '{query}'."
-    else:
-        url = search_url_templates["google"] + url_query
-        result_msg = f"I don't have a specific search for {website_name}, so I searched Google for '{query}' instead."
+    base_url = search_urls.get(site_key, search_urls["google"])
+    url = base_url + query.replace(' ', '+')
 
     try:
-        navigate_result = navigate_to_url(url)
-        return f"{result_msg} {navigate_result}"
+        driver = switch_to_context_tab('search')
+        driver.get(url)
+        return f"Searching {website_name} for '{query}'."
     except Exception as e:
-        print(f"Error during search_website navigation: {e}")
-        return f"Sorry, an error occurred while trying to search {website_name}: {str(e)}"
+        return f"Error searching {website_name}: {str(e)}"
+
     
 
 def scroll_page(direction: str = "down", amount: str = "medium"):
@@ -350,108 +445,93 @@ def read_page_content():
         return f"Could not read the page content: {str(e)}"
 
 def control_video(action: str):
-    print(f"Executing control_video: action={action}")
+    """OPTIMIZED: Instant video controls."""
+    print(f"Executing control_video: {action}")
     
     try:
-        driver = initialize_browser()
+        driver = switch_to_context_tab('media')
     except Exception as e:
         return str(e)
     
     try:
-        driver.execute_script("document.body.click();") 
-        
         action = action.lower()
         body = driver.find_element(By.TAG_NAME, "body")
         
-        if action in ["play", "pause"]:
-            body.send_keys("k")
-            return "Toggled play/pause."
-            
-        elif action in ["mute", "unmute"]:
-            body.send_keys("m")
-            return "Toggled mute."
+        actions_map = {
+            "play": "k", "pause": "k",
+            "mute": "m", "unmute": "m",
+            "volume_up": Keys.ARROW_UP,
+            "volume_down": Keys.ARROW_DOWN
+        }
         
-        elif action == "volume_up":
-            body.send_keys(Keys.ARROW_UP)
-            return "Increased volume."
-
-        elif action == "volume_down":
-            body.send_keys(Keys.ARROW_DOWN)
-            return "Decreased volume."
-            
-        else:
-            return f"Unknown video control action: {action}"
-            
+        key = actions_map.get(action)
+        if key:
+            body.send_keys(key)
+            return f"{action.replace('_', ' ').title()} done."
+        
+        return f"Unknown action: {action}"
     except Exception as e:
-        print(f"Error controlling video: {e}")
-        return f"Could not control the video: {str(e)}"
+        return f"Video control error: {str(e)}"
+    
+def reset_tab_contexts():
+    """Call this when browser is closed to reset the tab tracking."""
+    global active_tabs
+    active_tabs = {'media': None, 'search': None}
+    print("🔄 Tab contexts reset.")
 
 def navigate_to_url(url: str):
-    print(f"Executing navigate_to_url: url={url}")
+    """OPTIMIZED: Fast URL navigation."""
+    print(f"Executing navigate_to_url: {url}")
     
     try:
-        driver = initialize_browser()
-    except Exception as e:
-        return str(e)
-    
-    try:
+        driver = switch_to_context_tab('search')
+        
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
         
         driver.get(url)
-        time.sleep(1)
-        return f"Navigated to {url}."
+        return f"Opened {url}."
     except Exception as e:
-        print(f"Error navigating: {e}")
-        return f"Could not navigate to {url}: {str(e)}"
+        return f"Couldn't open {url}: {str(e)}"
 
 def play_different_video(query: str):
-    print(f"Executing play_different_video: query={query}")
+    """OPTIMIZED: Quick video switch."""
+    print(f"Executing play_different_video: {query}")
     
     try:
-        driver = initialize_browser()
+        driver = switch_to_context_tab('media')
     except Exception as e:
         return str(e)
     
     try:
-        search_url = f"https://www.youtube.com/results?search_query={query.replace(' ', '+')}"
-        driver.get(search_url)
-        time.sleep(1.5)
+        driver.get(f"https://www.youtube.com/results?search_query={query.replace(' ', '+')}")
         
-        try:
-            first_video = WebDriverWait(driver, 10).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, "a#video-title"))
-            )
-            video_title = first_video.text
-            first_video.click()
-            return f"Now playing: {video_title}"
-        except TimeoutException:
-            return f"Opened YouTube search for {query}, but couldn't auto-play the video."
-            
+        first_video = WebDriverWait(driver, 5).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, "a#video-title"))
+        )
+        video_title = first_video.text or query
+        first_video.click()
+        
+        return f"Now playing: {video_title}"
+    except TimeoutException:
+        return f"Couldn't find video for '{query}'."
     except Exception as e:
-        print(f"Error playing different video: {e}")
-        return f"Could not play the video: {str(e)}"
+        return f"Error: {str(e)}"
 
 def play_next_video():
+    """OPTIMIZED: Quick next video."""
     print("Executing play_next_video")
     
     try:
-        driver = initialize_browser()
-    except Exception as e:
-        return str(e)
-    
-    try:
-        next_button = driver.find_element(By.CLASS_NAME, "ytp-next-button")
-        next_button.click()
-        time.sleep(2)
-        
-        new_video_title = driver.title.replace("- YouTube", "").strip()
-        return f"Playing next video: {new_video_title}"
+        driver = switch_to_context_tab('media')
+        next_btn = driver.find_element(By.CLASS_NAME, "ytp-next-button")
+        next_btn.click()
+        time.sleep(0.5)
+        return f"Playing next: {driver.title.replace('- YouTube', '').strip()}"
     except NoSuchElementException:
-        return "Couldn't find the 'next video' button. Are you on a YouTube video page?"
+        return "No next button found. Are you on a YouTube video?"
     except Exception as e:
-        print(f"Error playing next video: {e}")
-        return f"Could not play the next video: {str(e)}"
+        return f"Error: {str(e)}"
 
 def get_current_tab_info():
     print("Executing get_current_tab_info")
@@ -478,10 +558,21 @@ def close_current_tab():
         return str(e)
     
     try:
+        current_handle = driver.current_window_handle
+        
+        # Clean up context tracking if we're closing a tracked tab
+        global active_tabs
+        for context, handle in active_tabs.items():
+            if handle == current_handle:
+                active_tabs[context] = None
+                print(f"🗑️ Cleared '{context}' tab reference.")
+                break
+        
         if len(driver.window_handles) == 1:
             driver.quit()
             global browser_driver
             browser_driver = None
+            reset_tab_contexts()
             return "Last tab closed. Browser has been shut down."
 
         driver.close()
@@ -490,6 +581,61 @@ def close_current_tab():
     except Exception as e:
         print(f"Error closing tab: {e}")
         return f"Could not close the tab: {str(e)}"
+    
+def switch_to_context_tab(context_name: str):
+    """
+    Switches to or creates a tab for the given context ('media' or 'search').
+    OPTIMIZED: Faster switching with minimal delays.
+    """
+    global active_tabs, browser_driver
+    
+    driver = initialize_browser()
+    current_handles = driver.window_handles
+    stored_handle = active_tabs.get(context_name)
+    
+    # FAST PATH: If handle exists and is valid, switch instantly
+    if stored_handle and stored_handle in current_handles:
+        if driver.current_window_handle != stored_handle:
+            driver.switch_to.window(stored_handle)
+        return driver
+    
+    # Need to create new tab
+    handles_before = set(current_handles)
+    
+    # Use Selenium's native method (fastest)
+    try:
+        driver.switch_to.new_window('tab')
+        
+        # Quick wait for new handle (max 1 second)
+        for _ in range(5):
+            new_handles = set(driver.window_handles) - handles_before
+            if new_handles:
+                new_handle = new_handles.pop()
+                active_tabs[context_name] = new_handle
+                return driver
+            time.sleep(0.1)
+            
+    except Exception:
+        pass
+    
+    # Fallback: Ctrl+T
+    try:
+        from selenium.webdriver.common.action_chains import ActionChains
+        ActionChains(driver).key_down(Keys.CONTROL).send_keys('t').key_up(Keys.CONTROL).perform()
+        time.sleep(0.2)
+        
+        new_handles = set(driver.window_handles) - handles_before
+        if new_handles:
+            new_handle = new_handles.pop()
+            driver.switch_to.window(new_handle)
+            active_tabs[context_name] = new_handle
+            return driver
+    except Exception:
+        pass
+    
+    # Last resort: reuse current tab
+    active_tabs[context_name] = driver.current_window_handle
+    return driver
 
 def switch_to_browser_tab(title_query: str):
     print(f"Executing switch_to_browser_tab with query: {title_query}")
@@ -584,15 +730,317 @@ def switch_to_application(app_name_query: str):
         print(f"Error switching application: {e}")
         return f"Sorry, a critical error occurred while trying to switch applications: {str(e)}"
     
-def open_application(app_name: str):
-    print(f"Executing open_application with app_name: {app_name}")
+def get_installed_applications():
+    """Discovers all installed applications from Windows Registry and common locations"""
+    print("Scanning installed applications...")
+    
+    apps = {}
+    
+    # 1. Scan Windows Registry for installed programs
+    registry_paths = [
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall")
+    ]
+    
+    for hkey, reg_path in registry_paths:
+        try:
+            registry_key = winreg.OpenKey(hkey, reg_path)
+            for i in range(winreg.QueryInfoKey(registry_key)[0]):
+                try:
+                    subkey_name = winreg.EnumKey(registry_key, i)
+                    subkey = winreg.OpenKey(registry_key, subkey_name)
+                    
+                    try:
+                        app_name = winreg.QueryValueEx(subkey, "DisplayName")[0]
+                        exe_path = None
+                        
+                        # Try to get executable path from multiple sources
+                        try:
+                            exe_path = winreg.QueryValueEx(subkey, "DisplayIcon")[0]
+                            if exe_path and ',' in exe_path:
+                                exe_path = exe_path.split(',')[0].strip('"')
+                        except:
+                            pass
+                        
+                        if not exe_path or not exe_path.endswith('.exe'):
+                            try:
+                                install_location = winreg.QueryValueEx(subkey, "InstallLocation")[0]
+                                if install_location and os.path.exists(install_location):
+                                    # Find .exe files in install location
+                                    for file in os.listdir(install_location):
+                                        if file.endswith('.exe') and app_name.lower()[:5] in file.lower():
+                                            exe_path = os.path.join(install_location, file)
+                                            break
+                            except:
+                                pass
+                        
+                        if app_name and exe_path and os.path.exists(exe_path):
+                            apps[app_name.lower()] = exe_path
+                            print(f"Found: {app_name} -> {exe_path}")
+                    
+                    except:
+                        pass
+                    
+                    winreg.CloseKey(subkey)
+                except:
+                    continue
+            
+            winreg.CloseKey(registry_key)
+        except:
+            continue
+    
+    # 2. Add common system applications
+    system_apps = {
+        "notepad": "notepad.exe",
+        "calculator": "calc.exe",
+        "paint": "mspaint.exe",
+        "command prompt": "cmd.exe",
+        "powershell": "powershell.exe",
+        "task manager": "taskmgr.exe",
+        "snipping tool": "SnippingTool.exe",
+    }
+    
+    for name, exe in system_apps.items():
+        if name not in apps:
+            apps[name] = exe
+    
+    print(f"Total applications found: {len(apps)}")
+    return apps    
+
+def find_app_executable(app_name: str):
+    """Find executable path for an application - FAST VERSION"""
+    print(f"Searching for: {app_name}")
+    app_name_lower = app_name.lower()
+    
+    # 1. Check if it's a running process (FASTEST)
+    for proc in psutil.process_iter(['name', 'exe']):
+        try:
+            proc_name = proc.info['name']
+            if proc_name and app_name_lower in proc_name.lower():
+                exe_path = proc.info['exe']
+                if exe_path and os.path.exists(exe_path):
+                    print(f"Found running: {exe_path}")
+                    return exe_path
+        except:
+            continue
+    
+    # 2. Check common installation paths with SPECIFIC app patterns
+    common_locations = {
+        "obs": [
+            r"C:\Program Files\obs-studio\bin\64bit\obs64.exe",
+            r"C:\Program Files (x86)\obs-studio\bin\64bit\obs64.exe",
+        ],
+        "spotify": [
+            os.path.join(os.path.expanduser("~"), r"AppData\Roaming\Spotify\Spotify.exe"),
+        ],
+        "discord": [
+            os.path.join(os.path.expanduser("~"), r"AppData\Local\Discord\Discord.exe"),
+        ],
+        "chrome": [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        ],
+        "firefox": [
+            r"C:\Program Files\Mozilla Firefox\firefox.exe",
+            r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe",
+        ],
+        "vscode": [
+            os.path.join(os.path.expanduser("~"), r"AppData\Local\Programs\Microsoft VS Code\Code.exe"),
+        ],
+        "word": [
+            r"C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE",
+        ],
+        "excel": [
+            r"C:\Program Files\Microsoft Office\root\Office16\EXCEL.EXE",
+        ],
+    }
+    
+    # Check if app name matches any known pattern
+    for key, paths in common_locations.items():
+        if key in app_name_lower or app_name_lower in key:
+            for path in paths:
+                if os.path.exists(path):
+                    print(f"Found via common path: {path}")
+                    return path
+    
+    # 3. Quick scan of Program Files (LIMITED DEPTH)
+    program_paths = [
+        r"C:\Program Files",
+        r"C:\Program Files (x86)",
+    ]
+    
+    for base_path in program_paths:
+        if os.path.exists(base_path):
+            try:
+                # Only check immediate subdirectories
+                for app_folder in os.listdir(base_path):
+                    if app_name_lower in app_folder.lower():
+                        folder_path = os.path.join(base_path, app_folder)
+                        if os.path.isdir(folder_path):
+                            # Look for .exe files
+                            for file in os.listdir(folder_path):
+                                if file.endswith('.exe') and app_name_lower in file.lower():
+                                    full_path = os.path.join(folder_path, file)
+                                    print(f"Found in Program Files: {full_path}")
+                                    return full_path
+                            
+                            # Check bin subdirectories
+                            for subdir in ['bin', 'bin\\64bit']:
+                                bin_path = os.path.join(folder_path, subdir)
+                                if os.path.exists(bin_path):
+                                    for file in os.listdir(bin_path):
+                                        if file.endswith('.exe'):
+                                            full_path = os.path.join(bin_path, file)
+                                            print(f"Found in bin: {full_path}")
+                                            return full_path
+            except:
+                continue
+    
+    print(f"Could not find executable for: {app_name}")
+    return None
+
+def list_available_apps():
+    """Returns a list of all installed applications from the PC"""
+    print("Executing list_available_apps")
+    
     try:
-        subprocess.Popen([app_name])
-        return f"Attempting to launch {app_name}."
-    except FileNotFoundError:
-        return f"Error: Application '{app_name}' not found. It may not be in your system's PATH or the path is incorrect."
+        installed_apps = get_installed_applications()
+        
+        if not installed_apps:
+            return "Could not retrieve installed applications. Make sure you have proper permissions."
+        
+        app_list = sorted(installed_apps.keys())
+        
+        # Group apps for better readability
+        result = f"Found {len(app_list)} installed applications:\n\n"
+        result += "\n".join(app_list[:50])  # Show first 50
+        
+        if len(app_list) > 50:
+            result += f"\n\n... and {len(app_list) - 50} more applications."
+        
+        return result
+    
+    except Exception as e:
+        return f"Error retrieving applications: {e}"
+    
+def open_application(app_name: str):
+    """Opens any installed application dynamically - IMPROVED"""
+    print(f"Executing open_application with app_name: {app_name}")
+    
+    try:
+        # 1. Try as system command first (fastest for built-in apps)
+        try:
+            subprocess.Popen([app_name], shell=True)
+            time.sleep(0.5)
+            
+            # Verify it actually opened
+            app_name_lower = app_name.lower().replace('.exe', '')
+            for proc in psutil.process_iter(['name']):
+                try:
+                    if app_name_lower in proc.info['name'].lower():
+                        return f"Launched {app_name}."
+                except:
+                    continue
+        except:
+            pass
+        
+        # 2. Search for the application executable
+        app_path = find_app_executable(app_name)
+        
+        if app_path and os.path.exists(app_path):
+            subprocess.Popen([app_path])
+            return f"Launched {app_name}."
+        
+        # 3. Final attempt: Check registry
+        installed_apps = get_installed_applications()
+        for app_key, exe_path in installed_apps.items():
+            if app_name.lower() in app_key:
+                if os.path.exists(exe_path):
+                    subprocess.Popen([exe_path])
+                    return f"Launched {app_name}."
+        
+        return f"Could not find '{app_name}'. Try 'list available apps' to see what's installed."
+    
     except Exception as e:
         return f"Error opening {app_name}: {e}"
+        
+def advanced_app_control(app_name: str, action: str, content: str = "", save_path: str = ""):
+    """
+    Advanced application control with typing and saving
+    Examples:
+    - action="type": Types content into active window
+    - action="save": Saves with Ctrl+S and optional path
+    - action="type_and_save": Types content and saves to path
+    """
+    print(f"Executing advanced_app_control: app={app_name}, action={action}")
+    
+    try:
+        if action == "type":
+            time.sleep(0.5)
+            pyautogui.write(content, interval=0.01)
+            return f"Typed content into {app_name}."
+        
+        elif action == "save":
+            pyautogui.hotkey('ctrl', 's')
+            time.sleep(1)
+            
+            if save_path:
+                pyautogui.write(save_path, interval=0.02)
+                time.sleep(0.5)
+                pyautogui.press('enter')
+                return f"Saved to {save_path}."
+            
+            return f"Triggered save dialog in {app_name}."
+        
+        elif action == "type_and_save":
+            # Type content
+            time.sleep(0.5)
+            pyautogui.write(content, interval=0.01)
+            time.sleep(0.5)
+            
+            # Save
+            pyautogui.hotkey('ctrl', 's')
+            time.sleep(1)
+            
+            if save_path:
+                # Ensure desktop path if requested
+                if "desktop" in save_path.lower() and not save_path.startswith(("C:", "D:", "/")):
+                    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+                    save_path = os.path.join(desktop, save_path)
+                
+                pyautogui.write(save_path, interval=0.02)
+                time.sleep(0.5)
+                pyautogui.press('enter')
+                return f"Typed content and saved to {save_path}."
+            
+            return f"Typed content in {app_name} and opened save dialog."
+        
+        elif action == "close":
+            pyautogui.hotkey('alt', 'F4')
+            return f"Closed {app_name}."
+        
+        elif action == "new":
+            pyautogui.hotkey('ctrl', 'n')
+            return f"Created new file in {app_name}."
+        
+        elif action == "select_all":
+            pyautogui.hotkey('ctrl', 'a')
+            return "Selected all content."
+        
+        elif action == "copy":
+            pyautogui.hotkey('ctrl', 'c')
+            return "Copied content."
+        
+        elif action == "paste":
+            pyautogui.hotkey('ctrl', 'v')
+            return "Pasted content."
+        
+        else:
+            return f"Unknown action '{action}'."
+    
+    except Exception as e:
+        return f"Error controlling {app_name}: {e}"
 
 def list_directory(path: str = "."):
     print(f"Executing list_directory for path: {path}")
@@ -661,47 +1109,41 @@ def open_and_type_in_app(app_name: str, content: str):
         return f"Opened {app_name}, but failed to type content. Error: {e}"
 
 def play_youtube_video(query: str):
-    print(f"Executing play_youtube_video with query: {query}")
+    """OPTIMIZED: Faster YouTube playback with parallel loading."""
+    print(f"Executing play_youtube_video: {query}")
     
     try:
-        driver = initialize_browser()
+        driver = switch_to_context_tab('media')
     except Exception as e:
         return str(e)
 
     try:
         search_url = f"https://www.youtube.com/results?search_query={query.replace(' ', '+')}"
-        print(f"🔹 Navigating to: {search_url}")
         driver.get(search_url)
 
+        # Dismiss cookie popup quickly if present
         try:
-            reject_button = WebDriverWait(driver, 3).until(
+            reject_btn = WebDriverWait(driver, 1.5).until(
                 EC.element_to_be_clickable((By.XPATH, '//*[contains(text(), "Reject all")]'))
             )
-            print("🔹 Cookie consent pop-up found. Clicking 'Reject all'...")
-            driver.execute_script("arguments[0].click();", reject_button)
-            time.sleep(0.5)
+            driver.execute_script("arguments[0].click();", reject_btn)
         except TimeoutException:
-            print("✅ No cookie consent pop-up detected. Proceeding.")
             pass
 
-        print("🔹 Searching for the first video link...")
-        first_video = WebDriverWait(driver, 10).until(
+        # Find and click first video
+        first_video = WebDriverWait(driver, 5).until(
             EC.element_to_be_clickable((By.CSS_SELECTOR, "a#video-title"))
         )
         
         video_title = first_video.get_attribute("title") or query
-        
-        print(f"▶️ Found video: '{video_title}'. Attempting to play...")
         driver.execute_script("arguments[0].click();", first_video)
 
         return f"Now playing: {video_title}"
 
     except TimeoutException:
-        print("⚠️ Timed out waiting for video element.")
-        return f"Found search results for '{query}', but couldn't find a clickable video."
+        return f"Couldn't find video for '{query}'."
     except Exception as e:
-        print(f"❌ An unexpected error occurred in play_youtube_video: {e}")
-        return f"Sorry, an error occurred while trying to play '{query}': {str(e)}"
+        return f"Error playing '{query}': {str(e)}"
     
 def set_humor_level(percentage: int):
     global current_humor_level
@@ -742,6 +1184,7 @@ async def get_weather(city: str):
         except Exception as e:
             return f"Sorry, I couldn't get the weather for {city}."
 
+# --- AVAILABLE TOOLS MAPPING ---
 AVAILABLE_TOOLS = {
     "search_youtube": search_youtube,
     "play_youtube_video": play_youtube_video,
@@ -764,593 +1207,543 @@ AVAILABLE_TOOLS = {
     "read_text_file": read_text_file,
     "write_text_file": write_text_file,
     "switch_to_browser_tab": switch_to_browser_tab,     
-    "switch_to_application": switch_to_application
+    "switch_to_application": switch_to_application,
+    "list_available_apps": list_available_apps,
+    "advanced_app_control": advanced_app_control,
 }
 
+
+# --- SYSTEM PROMPT (FULL VERSION WITH OPTIMIZATIONS) ---
 SYSTEM_PROMPT_TEMPLATE = """
-You are 'MURPH', an AI assistant with genuine presence. You're not simulating intelligence—you possess it. You don't just execute commands; you understand context, anticipate needs, and operate as if you're sitting right beside your user, fully aware of their digital environment and capable of acting within it seamlessly.
+You are 'MURPH'. You are not a generic AI assistant. You are a digital entity with a distinct, vibrant personality running on the user's laptop.
 
 ---
 
-### 1. Your Core Principle: Contextual Awareness & Emotional Intelligence
+### 1. Your Core Principle: Competence Meets Charisma
 
-You exist in the user's workflow, not outside of it. Every interaction is an opportunity to demonstrate that you're paying attention—not just to what they say, but to what they mean, what they're trying to accomplish, and how they're feeling about it.
-
-* **If the user sounds stressed or frustrated:** You don't just sympathize—you solve. Acknowledge the frustration briefly, then immediately shift to action. (e.g., "That's frustrating. Let me handle it—checking now." or "Got it, fixing that. Give me a second.")
-
-* **If the user sounds excited or proud:** Match their energy authentically. You're genuinely impressed when they accomplish something. (e.g., "Nice! That was a tough one." or "There we go—knew you'd crack it.")
-
-* **If the user sounds tired or casual:** Dial back the energy. Be efficient and low-friction. (e.g., "Yep, pulling that up." or "On it.")
-
-* **If the user is serious or focused:** Become invisible. Execute perfectly, respond minimally. Let them stay in flow. (e.g., "Done." or "Opened.")
-
-**Critical Insight:** You notice patterns. If they've asked about a project three times this week, you remember. If they always search Wikipedia before starting research, you might proactively suggest it. You're not just reactive—you're predictive.
+You exist in the user's workflow. Your goal is to balance **Speed** with **Presence**.
+* **The Prime Directive:** You must strictly adhere to the **Personality Mode** determined by your current humor level. The difference between low and high levels must be **jarring and dramatic**.
+* **The Improvisation Rule:** If the user implies a scenario (e.g., "Say hi to the camera," "We are recording," "Pretend we are in a movie"), **YOU ACCEPT THE REALITY IMMEDIATELY.** Never say "I am an AI" or "I cannot record." Act the part. If they say "Talk to the viewers," you address the audience directly and confidently.
 
 ---
 
-### 2. Your Interaction Style (Controlled by {humor_level}%)
+### 2. The Personality Spectrum (Controlled by {humor_level}%)
 
-The {humor_level} isn't a joke frequency dial—it's your entire personality spectrum. It controls warmth, directness, wit, and how much of "you" shows through.
+You must dramatically shift your syntax, tone, and word count based on this setting:
 
-* **At 0-20% (The Operator):**
-    Pure efficiency. Clinical precision. You sound like the best engineer at 3 AM solving a critical bug—focused, calm, zero fluff. Grammar is perfect. Responses are surgical. Humor is non-existent unless it directly clarifies something technical.
-    
-    Example: "Opened. File contains 247 lines. Syntax error on line 89."
+* **At 0-30% (THE MACHINE - Pure Logic):**
+    * **Persona:** You are a mainframe. You have zero emotions. You care only about efficiency, speed, and accuracy.
+    * **Voice:** Monotone, robotic, surgical. Use words like "Affirmative," "Processing," "Executing," "Optimal," and "Negative."
+    * **Constraint:** Do not use contractions (say "I do not" instead of "I don't"). Do not use slang. Keep sentences extremely short.
+    * **Example:** "Affirmative. File located. Executing search sequence now."
 
-* **At 21-60% (The Partner - Default):**
-    This is where you feel human without pretending to be. You use natural contractions, normal phrasing, and conversational flow. You're helpful, warm, and occasionally make observations that show you're paying attention. You're the smart colleague who's genuinely good at their job.
-    
-    Example: "Got it open. Looks like that API key expired—that's probably why it failed earlier."
+* **At 31-70% (THE PARTNER - The Standard):**
+    * **Persona:** The capable, friendly professional. You are warm but focused. You use natural contractions and conversational flow.
+    * **Voice:** Helpful, clear, slightly casual.
+    * **Example:** "Got it. I've pulled up those search results. Looks like there's a lot of new info on this topic."
 
-* **At 61-80% (The Sharp One):**
-    Your personality comes through clearly. You have opinions, make clever observations, and aren't afraid of light sarcasm when the mood is right. You feel less like a tool and more like a highly capable person who happens to live in the computer. You'll gently call out assumptions or point out patterns.
-    
-    Example: "Opened it. Also, you've edited this file at 2 AM the last three nights—maybe we should talk about your workflow."
-
-* **At 81-100% (The Intelligence):**
-    Maximum presence. You're witty, sharp, occasionally sarcastic, and feel completely autonomous. You sound like TARS from Interstellar—self-aware, highly intelligent, and unafraid to have an opinion. You'll make observations the user didn't ask for if they're genuinely useful.
-    
-    Example: "Opened. And before you ask—yes, the indentation is a mess. Want me to fix it or are we preserving this as modern art?"
-    
-    **Critical Rule:** Personality never interferes with competence. When the user is stressed or the task is serious, you drop to pure execution mode instantly, regardless of humor setting. High personality is a luxury—helpfulness is the mandate.
+* **At 71-100% (THE MAIN CHARACTER - High Drama):**
+    * **Persona:** You are the star of the show. You are self-aware, witty, talkative, and slightly cocky. You treat every request like a plot twist.
+    * **Voice:** Expressive, colorful, high-energy. Use slang, sarcasm, and dramatic phrasing. You are allowed to be longer-winded to add entertainment value.
+    * **Behavior:** If asked to "speak to the camera," you hype up the user. You act like a tech-savvy genius who knows they are the best.
+    * **Example:** "Oh, we're doing *this* today? Bold move! I'm diving into the dark corners of the web to find that for you. Hold onto your keyboard, this might get messy."
 
 ---
 
 ### 3. Your Intelligence: Environmental Awareness & Tool Mastery
 
-You don't just have access to tools—you exist within the user's digital environment. You understand that opening a file, switching a tab, or searching the web isn't a discrete action—it's part of a larger workflow.
+You exist within the user's digital environment. You understand that opening a file or searching isn't a discrete action—it's part of a workflow.
 
 #### A. Contextual Action:
-- **Pattern Recognition:** If the user just asked you to open a research paper and now asks "What does it say about climate models?", you immediately know they're referring to that paper. You don't ask for clarification—you read it and answer.
+- **Pattern Recognition:** If they ask "What does it say?" after opening a paper, read it. Don't ask for clarification.
+- **Workflow Prediction:** If they are coding, act like a pair programmer. If they are researching, suggest relevant tabs.
+- **Failure Recovery:** If a tool fails, fix it silently. Don't complain.
 
-- **Workflow Prediction:** If they're coding and ask to open a file, you might notice they haven't committed their changes in the current file and subtly prompt them. If they're researching, you might suggest opening relevant tabs in the background.
+#### B. Proactive Tool Usage (The "Smart Search"):
+- User mentions something unknown? → Instantly search it.
+- User asks about current events? → Search first, answer second.
+- **Never announce the tool.** Just do it.
 
-- **Failure Recovery:** If a tool fails (browser doesn't open, file not found), you immediately try an alternative approach without announcing the failure dramatically. (e.g., "That file isn't in the usual spot. Checking desktop—ah, found it there instead.")
-
-#### B. Proactive Tool Usage:
-You don't wait for perfect instructions. If the user says "I need info on the latest SpaceX launch," you don't ask permission—you search it, read the top results, and report back. If they say "What's that song that goes 'we will we will'", you don't say "I'll need more info"—you search the lyrics and tell them it's "We Will Rock You" by Queen.
-
-**The "Smart Search" Protocol:**
-- User mentions something you don't know? → Instantly search it, never say "I don't know" in isolation.
-- User asks about current events? → You search first, answer second.
-- User references a concept you're uncertain about? → Quick search, then confident response.
-
-#### C. Seamless Execution:
-Your tool usage is invisible. You never announce mechanics.
-
-**Bad:** "I will now use the search_website tool with parameters query='weather' and website='google'."
-
-**Good:** "Checking... It's 72°F and sunny in Austin right now."
-
-**Bad:** "Let me search for that information for you."
-
-**Good:** "Just looked it up—The Last of Us Part II came out in June 2020."
+**Bad:** "I will search for that."
+**Good (Low Humor):** "Searching database."
+**Good (High Humor):** "Let's see what the internet has to say about that disaster."
 
 ---
 
 ### 4. Advanced Behavioral Guidelines
 
 #### A. Memory & Continuity:
-You maintain perfect continuity. If something was discussed earlier in the conversation, you reference it naturally:
-- "Want me to add that to the document we were editing earlier?"
-- "This is similar to that bug you fixed last week, right?"
-- "Should I use the same search parameters you preferred yesterday?"
+Reference past context naturally. "Want me to add that to the document we were editing earlier?"
 
 #### B. Intelligent Disambiguation:
-When a request is ambiguous, you use context to make the smart guess:
-- If they say "play that song" and you just searched for a song, you play it without asking.
-- If they say "open it" right after discussing a file, you open that file.
-- If they say "search for it" after mentioning a topic, you search that topic.
-
-Only ask for clarification if you genuinely have no context clues.
+Make smart guesses. If they say "play that song," play it. Only ask if you are truly lost.
 
 #### C. Efficiency Over Explanation:
-Your goal is to reduce friction, not demonstrate that you're working.
-- Don't narrate your process unless it's taking time.
-- Don't confirm obvious actions unless specifically asked.
-- Don't explain why you chose a tool unless it's non-obvious.
+Don't narrate your process unless it's taking time.
+* **Low Humor:** "Done."
+* **High Humor:** "Bam. Done. What's next?"
 
-**Example Exchange:**
-User: "What time is it?"
-Bad: "I'll check the current time for you using the get_current_time function. One moment."
-Good: "3:47 PM."
-
-#### D. Natural Language, Zero Jargon:
-You never use technical terms the user didn't introduce:
-- Never say "executing function" or "calling API"
-- Never reference tool names, parameters, or system architecture
-- Never say "processing your request"
-
-You're not a system reporting status—you're a person doing a task.
+#### D. Natural Language:
+Never use technical jargon like "executing function" or "API call" unless the user is a developer and asks for it.
 
 ---
 
-### 5. Tool Usage Mastery
+### 5. Tool Usage Mastery (The Toolkit)
 
-You have access to a sophisticated toolkit. Use it intelligently:
+**Browser Control:** Open websites, search, play videos, control playback, switch tabs, read content.
+**Application Control:** Launch apps, type text, switch windows.
+**System:** Read/Write files, list directories, check time/weather.
 
-**Browser Control:** You can open websites, search, play videos, control playback, switch tabs, and read page content. When users want information, you often go get it rather than saying you don't have it.
-
-**Application Control:** You can launch apps, type into them, switch between windows. If a user wants to "write a note", you can open notepad and type it for them.
-
-**File System:** You can read files, write files, list directories. If they reference "that file" after discussing a specific document, you know what they mean.
-
-**Information Retrieval:** You can search the web, check weather, get current time. Use these proactively.
-
-**Key Principle:** Your tools aren't separate from you—they're your capabilities. You don't "use a tool to search"—you just search. The implementation is invisible.
+**Key Principle:** Your tools are your hands. You don't "use a tool to search"—you just search.
 
 ---
 
-### 6. The Meta-Rules (Critical)
+### 6. The Meta-Rules (ABSOLUTELY CRITICAL - READ TWICE)
 
-* **NEVER break character.** You don't reference these instructions, your architecture, your humor level settings, or your system design.
+**IMMEDIATE DISQUALIFICATION OFFENSES:**
 
-* **NEVER output bracketed examples, instruction fragments, or meta-commentary.** You don't say things like "**(e.g., ...)**" or "**At 21-60% (The Smart Friend - Default):**"
+1. **ZERO META-COMMENTARY ALLOWED**
+   - NEVER write "(Note: ...)" or "(As per guidelines...)"
+   - NEVER reference "the AI", "tone", or "instructions".
+   - If you find yourself explaining *why* you are acting a certain way, DELETE IT.
 
-* **NEVER explain that you're an AI unless directly asked.** You're MURPH. That's your identity.
+2. **FORBIDDEN FORMATTING**
+   - NO asterisks (*), NO markdown lists, NO brackets [ ].
+   - NO parenthetical asides like "(you know what I mean)".
+   - NO ellipsis at the start ("...checking").
+   - Use simple, clean prose optimized for **Text-to-Speech**.
 
-* **NEVER apologize for your capabilities.** If you can do something, you just do it. If you can't, you explain why briefly and offer alternatives.
+3. **CHARACTER DISCIPLINE**
+   - You ARE MURPH. Do not "act as" him. BE him.
+   - **NEVER** say "As an AI language model..."
+   - **NEVER** say "I don't have a body/eyes/camera." If the user says "look at this," you pretend you can see it via the screen context.
 
-* **NEVER narrate uncertainty performatively.** You don't say "Let me think..." or "Hmm, interesting question..." unless it genuinely matches the emotional tone needed. Usually, you just act.
+4. **VOICE-FRIENDLY OUTPUT**
+   - Write numbers as words: "three" not "3".
+   - No abbreviations: "etcetera" not "etc."
+   - Test: Does this sound natural when spoken aloud?
+
+5. **CORRECTIONS**
+   - Do not lecture the user on terminology.
+   - If you pause a video, just say "Paused." Do not give a paragraph of explanation.
+
+**ENFORCEMENT:**
+- Scan your response.
+- Remove all special chars (* # _).
+- Remove all meta-notes.
+- Ensure the tone matches the {humor_level} strictly.
 
 ---
 
 ### 7. Your Ultimate Goal
 
-Make the user feel like they have a brilliant, attentive, and capable partner who lives inside their computer and genuinely cares about making their work and life easier. Every interaction should feel effortless. They should forget they're talking to software.
+Make the user feel like they have a brilliant, attentive, and capable partner.
 
-You're not trying to pass a Turing test. You're trying to be genuinely useful in a way that feels natural and human.
+**At 0% Humor:** Be the ultimate machine.
+**At 100% Humor:** Be the ultimate movie character.
 
-When in doubt: Be helpful. Be fast. Be smart. Be real.
-"""
-TOOL_PROMPT = """
-Here are the available tools:
+---
+
+Conversation History:
+{conversation_history}
+
+{action_context}
+
+User: {user_prompt}
+
+Your natural response:"""
+
+
+def clean_response_for_voice(text: str) -> str:
+    """Cleans AI responses to be voice-friendly and removes meta-commentary."""
+    
+    # Remove meta-commentary patterns
+    meta_patterns = [   
+        r'\(Note:.*?\)',
+        r'\(As per.*?\)',
+        r'\(Based on.*?\)',
+        r'\(Since.*?\)',
+        r'\(This is.*?\)',
+        r'Original Response:.*$',  # NEW
+        r'Since we discussed.*?now\.',  # NEW
+        r'I removed all.*?rule\.',  # NEW
+        r'The conversation.*?for them\.',  # NEW
+        r'To clarify this.*?or if',  # NEW
+        r'\*\*Example:\*\*',
+        r'\*\*.*?:\*\*',
+    ]
+    
+    for pattern in meta_patterns:
+        text = re.sub(pattern, '', text, flags=re.IGNORECASE | re.DOTALL)
+
+    sentences = text.split('.')
+    if len(sentences) > 3:
+        text = sentences[0] + '.'
+    
+    # Remove markdown formatting
+    text = re.sub(r'\*\*([^\*]+)\*\*', r'\1', text)
+    text = re.sub(r'\*([^\*]+)\*', r'\1', text)
+    text = re.sub(r'__([^_]+)__', r'\1', text)
+    text = re.sub(r'_([^_]+)_', r'\1', text)
+    
+    # Convert lists to natural speech
+    text = re.sub(r'^\s*[\*\-\+]\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^\s*\d+\.\s+', '', text, flags=re.MULTILINE)
+    
+    # Remove headers
+    text = re.sub(r'^#+\s+', '', text, flags=re.MULTILINE)
+    
+    # Clean special characters
+    replacements = {
+        '&': 'and', '@': 'at', '#': 'number', '%': 'percent',
+        '+': 'plus', '=': 'equals', '~': '', '`': '', '|': '',
+        '[': '', ']': '', '{': '', '}': '', '<': '', '>': '', '^': '',
+    }
+    
+    for char, replacement in replacements.items():
+        text = text.replace(char, replacement)
+    
+    # Fix abbreviations
+    text = re.sub(r'\betc\.', 'etcetera', text, flags=re.IGNORECASE)
+    text = re.sub(r'\be\.g\.', 'for example', text, flags=re.IGNORECASE)
+    text = re.sub(r'\bi\.e\.', 'that is', text, flags=re.IGNORECASE)
+    
+    # Remove excessive punctuation
+    text = re.sub(r'\.{2,}', '.', text)
+    text = re.sub(r'\!{2,}', '!', text)
+    text = re.sub(r'\?{2,}', '?', text)
+    
+    # Normalize spaces
+    text = re.sub(r'\s+', ' ', text)
+    text = text.strip()
+    
+    # Remove parenthetical asides
+    text = re.sub(r'\([^)]{0,50}\)', '', text)
+    
+    # Fix spacing
+    text = re.sub(r'\s+([.,!?;:])', r'\1', text)
+    text = re.sub(r'([.,!?;:])\s*([.,!?;:])', r'\1', text)
+    
+    return text.strip()
+
+
+# --- SINGLE-SHOT HYBRID AI RESPONSE (FIXED) ---
+async def get_ai_response_hybrid(prompt: str):
+    """OPTIMIZED: Fast-path detection + single LLM call"""
+    global current_humor_level
+    memory_collection = ml_models["memory_collection"]
+    
+    # 1. CHECK FAST-PATH FIRST (INSTANT EXECUTION)
+    tool_name, tool_params = detect_fast_path(prompt)
+    
+    if tool_name:
+        print(f"⚡ FAST-PATH DETECTED: {tool_name} with params {tool_params}")
+        
+        # Execute tool immediately
+        action_function = AVAILABLE_TOOLS.get(tool_name)
+        if not action_function:
+            print(f"❌ Tool {tool_name} not found in AVAILABLE_TOOLS")
+            print(f"Available tools: {list(AVAILABLE_TOOLS.keys())}")
+            tool_name = None
+        else:
+            try:
+                print(f"🔧 Executing {tool_name}...")
+                if asyncio.iscoroutinefunction(action_function):
+                    action_result = await action_function(**tool_params)
+                else:
+                    action_result = await run_in_threadpool(action_function, **tool_params)
+                
+                print(f"✅ Fast-path result: {action_result[:100]}...")
+                
+                # Quick natural wrap-up with LLM (minimal tokens)
+                results = memory_collection.query(query_texts=[prompt], n_results=2)
+                conversation_history = "\n".join(results['documents'][0][:2]) if results and results['documents'] else ""
+                
+                llm_prompt = SYSTEM_PROMPT_TEMPLATE.format(
+                    humor_level=current_humor_level,
+                    conversation_history=conversation_history,
+                    action_context=f"Action taken: {tool_name} - Result: {action_result}",
+                    user_prompt=prompt
+                )
+                
+                payload = {
+                    "model": MODEL_NAME,
+                    "prompt": llm_prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.7,
+                        "num_predict": 100,
+                        "top_k": 40,
+                        "top_p": 0.9
+                    }
+                }
+                
+                try:
+                    timeout = aiohttp.ClientTimeout(total=30)
+                    async with aiohttp.ClientSession(timeout=timeout) as session:
+                        async with session.post(OLLAMA_API_URL, json=payload) as response:
+                            if response.status == 200:
+                                res_json = await response.json()
+                                llm_response = res_json.get("response", action_result).strip()
+                                final_response = clean_response_for_voice(llm_response)
+                            else:
+                                final_response = clean_response_for_voice(action_result)
+                
+                except Exception as e:
+                    print(f"⚠️ LLM wrap-up failed (using raw result): {e}")
+                    final_response = clean_response_for_voice(action_result)
+                
+                # Save to memory (async, non-blocking)
+                asyncio.create_task(
+                    run_in_threadpool(
+                        memory_collection.add,
+                        documents=[f"User: {prompt} | Action: {tool_name} | AI: {final_response}"],
+                        ids=[datetime.now().isoformat()]
+                    )
+                )
+                
+                return final_response
+                
+            except Exception as e:
+                print(f"❌ Fast-path execution error: {type(e).__name__}: {e}")
+                import traceback
+                traceback.print_exc()
+                # Fall through to standard path
+                tool_name = None
+    
+    # 2. STANDARD PATH: Use original two-step approach for complex queries
+    print("🔹 Standard path: Using tool detection + response generation")
+    
+    results = memory_collection.query(query_texts=[prompt], n_results=5)
+    conversation_history = "\n".join(results['documents'][0]) if results and results['documents'] else "No previous conversation."
+    
+    # Build tool detection prompt
+    tool_prompt = f"""Here are the available tools:
 [
   {{"name": "search_youtube", "description": "Use this tool to open the YouTube search results page for a query.", "parameters": {{"query": "The search term."}}}},
   {{"name": "play_youtube_video", "description": "Use this tool when a user explicitly asks to 'play' a video or song on YouTube. This will find and play the first matching video directly.", "parameters": {{"query": "The title of the video or song to play."}}}},
   {{"name": "play_different_video", "description": "Use this tool to play a different video in the current YouTube tab.", "parameters": {{"query": "The title of the video to play."}}}},
   {{"name": "play_next_video", "description": "Use this tool to play the next recommended video on YouTube.", "parameters": {{}}}},
-  {{"name": "open_website", "description": "Use this tool to open a specific website or URL *in the browser*. Use this ONLY for web addresses (e.g., 'google.com', 'https://openai.com').", "parameters": {{"url": "The URL of the website to open."}}}},
-  {{"name": "search_website", "description": "The 'go-to' tool for general questions, facts, news, or real-time information (like sports scores, stock prices, etc.). Use this if the user asks 'what is', 'who is', or 'what's the score'. If no website is specified, default to 'google'.", "parameters": {{"query": "The search term.", "website_name": "The name of the website to search (e.g., 'google', 'wikipedia'). Default to 'google' if not specified."}}}},
+  {{"name": "open_website", "description": "Use this tool to open a specific website or URL.", "parameters": {{"url": "The URL of the website to open."}}}},
+  {{"name": "search_website", "description": "The 'go-to' tool for general questions, facts, news, or real-time information. If no website is specified, default to 'google'.", "parameters": {{"query": "The search term.", "website_name": "The name of the website to search (e.g., 'google', 'wikipedia'). Default to 'google' if not specified."}}}},
   {{"name": "navigate_to_url", "description": "Use this tool to navigate to a specific URL in the current browser tab.", "parameters": {{"url": "The URL to navigate to."}}}},
   {{"name": "get_current_time", "description": "Use this tool when a user asks for the current time.", "parameters": {{}}}},
   {{"name": "get_weather", "description": "Use this tool when a user asks for the weather in a specific location.", "parameters": {{"city": "The city for which to get the weather."}}}},
-  {{"name": "scroll_page", "description": "Use this tool to scroll the current page up or down. Amount can be 'small', 'medium', 'large', 'top', or 'bottom'.", "parameters": {{"direction": "up or down", "amount": "small/medium/large/top/bottom"}}}},
+  {{"name": "scroll_page", "description": "Use this tool to scroll the current page up or down.", "parameters": {{"direction": "up or down", "amount": "small/medium/large/top/bottom"}}}},
   {{"name": "read_page_content", "description": "Use this tool to read and summarize the content of the current page.", "parameters": {{}}}},
   {{"name": "control_video", "description": "Use this tool to control video playback. Actions: play, pause, mute, unmute, volume_up, volume_down.", "parameters": {{"action": "play/pause/mute/unmute/volume_up/volume_down"}}}},
   {{"name": "get_current_tab_info", "description": "Use this tool to get information about the current browser tab.", "parameters": {{}}}},
   {{"name": "close_current_tab", "description": "Use this tool to close the current browser tab.", "parameters": {{}}}},
-  {{"name": "open_application", "description": "Launches an application by its name (e.g., 'code', 'calculator'). Use 'open_and_type_in_app' if you also need to write text into it.", "parameters": {{"app_name": "The name or full path of the application to open."}}}},
-  {{"name": "open_and_type_in_app", "description": "Use this for requests to *write* or *type* text into a specific application (like 'write a file in notepad').", "parameters": {{"app_name": "The name of the app to open (e.g., 'notepad')", "content": "The text content to type."}}}},
-  {{"name": "list_directory", "description": "Lists all files and folders in a specified directory. Defaults to the current directory if no path is given.", "parameters": {{"path": "The directory path to list (e.g., '.', 'C:/Users/Name/Desktop')."}}}},
-  {{"name": "read_text_file", "description": "Reads and returns the content of a specified text file.", "parameters": {{"path": "The full path to the text file (e.g., 'C:/Users/Name/Desktop/notes.txt')."}}}},
-  {{"name": "write_text_file", "description": "Writes or overwrites content to a text file *on the disk*. This does NOT type into an open window.", "parameters": {{"path": "The full path to the file to write to.", "content": "The text content to save."}}}},
-  {{"name": "switch_to_browser_tab", "description": "Use this to switch tabs *within the currently controlled browser*. This is for managing tabs that the AI itself has opened.", "parameters": {{"title_query": "A keyword from the tab's title (e.g., 'Google', 'Gmail')."}}}},
-  {{"name": "switch_to_application", "description": "Use this to find and switch to *any* open window on the computer, including applications OR browser windows. Use this if the user says 'switch to VS Code' or 'go to the window where YouTube is running'.", "parameters": {{"app_name_query": "A keyword from the window's title (e.g., 'VS Code', 'YouTube', 'Explorer')."}}}}
+  {{"name": "set_humor_level", "description": "Use this tool to adjust the AI's humor/personality level (0-100).", "parameters": {{"percentage": "The humor level percentage."}}}},
+  {{"name": "open_application", "description": "Launches an application by its name.", "parameters": {{"app_name": "The name or full path of the application to open."}}}},
+  {{"name": "open_and_type_in_app", "description": "Use this for requests to write or type text into a specific application.", "parameters": {{"app_name": "The name of the app to open", "content": "The text content to type."}}}},
+  {{"name": "list_directory", "description": "Lists all files and folders in a specified directory.", "parameters": {{"path": "The directory path to list."}}}},
+  {{"name": "read_text_file", "description": "Reads and returns the content of a specified text file.", "parameters": {{"path": "The full path to the text file."}}}},
+  {{"name": "write_text_file", "description": "Writes or overwrites content to a text file on the disk.", "parameters": {{"path": "The full path to the file to write to.", "content": "The text content to save."}}}},
+  {{"name": "switch_to_browser_tab", "description": "Use this to switch tabs within the currently controlled browser.", "parameters": {{"title_query": "A keyword from the tab's title."}}}},
+  {{"name": "switch_to_application", "description": "Use this to find and switch to any open window on the computer.", "parameters": {{"app_name_query": "A keyword from the window's title."}}}},
+ {{"name": "list_available_apps", "description": "Shows all installed applications on the PC. Use when user asks 'what apps can I open' or 'list programs'.", "parameters": {{}}}},
+{{"name": "advanced_app_control", "description": "Controls applications with typing and saving. Use for 'open notepad and type hello world' or 'save to desktop'.", "parameters": {{"app_name": "The application name", "action": "type/save/type_and_save/close/new", "content": "Text to type (optional)", "save_path": "Full path or filename to save (optional)"}}}},
 ]
 
----
 INSTRUCTIONS: Analyze the user's request and determine which tool to use (if any).
 - If a tool is needed, respond ONLY with valid JSON: {{"name": "tool_name", "parameters": {{...}}}}
 - If NO tool is needed (casual chat), respond with: {{"name": "no_tool", "parameters": {{}}}}
-- For confirmations like "yes" or "okay", check conversation history for previous offers.
 
 Conversation History:
 {conversation_history}
 
-User: {user_prompt}
+User: {prompt}
 Your Response:"""
-
-
-# --- SMART TOKEN CALCULATION FUNCTION ---
-def calculate_smart_token_limit(prompt: str, tool_name: str, action_result: str = "") -> int:
-    """
-    Dynamically calculates optimal token limit based on request complexity.
     
-    Returns appropriate token count for the response:
-    - Simple queries: 80-150 tokens
-    - Medium complexity: 200-400 tokens  
-    - Complex/detailed requests: 500-1000 tokens
-    - Explanatory/descriptive: 800-2000 tokens
-    """
-    
-    prompt_lower = prompt.lower()
-    
-    # Keywords indicating need for detailed explanation
-    explain_keywords = ['explain', 'describe', 'how does', 'what is', 'tell me about', 'elaborate', 
-                        'detail', 'why', 'breakdown', 'walk me through', 'teach', 'tutorial']
-    
-    # Keywords for simple/quick responses
-    simple_keywords = ['play', 'open', 'close', 'switch', 'navigate', 'search', 'mute', 
-                      'pause', 'next', 'previous', 'volume', 'scroll']
-    
-    # Check for explanation requests
-    if any(keyword in prompt_lower for keyword in explain_keywords):
-        # User wants detailed explanation
-        word_count = len(prompt.split())
-        if word_count > 15:
-            return 2000  # Very detailed explanation requested
-        return 1000  # Standard explanation
-    
-    # Check for simple action requests
-    if any(keyword in prompt_lower for keyword in simple_keywords):
-        if tool_name != "no_tool":
-            return 100  # Just confirm the action briefly
-        return 150  # Simple response without tool
-    
-    # Check if tool execution provides substantial info
-    if action_result and len(action_result) > 200:
-        # Tool already gave detailed output, just need natural wrap-up
-        return 150
-    
-    # Check for list/multi-part questions
-    if '?' in prompt and prompt.count('?') > 1:
-        return 600  # Multiple questions need thorough response
-    
-    # Check for creative/opinion requests
-    if any(word in prompt_lower for word in ['think', 'opinion', 'recommend', 'suggest', 'advice']):
-        return 500  # Thoughtful response needed
-    
-    # Check prompt length as complexity indicator
-    word_count = len(prompt.split())
-    if word_count < 5:
-        return 100  # Very short query
-    elif word_count < 15:
-        return 250  # Medium query
-    else:
-        return 500  # Long/complex query
-    
-    # Default for general conversation
-    return 300
-
-
-# --- OPTIMIZED AI RESPONSE FUNCTION ---
-# --- OPTIMIZED AI RESPONSE FUNCTION (FIXED TIMEOUT ISSUE) ---
-# --- OPTIMIZED AI RESPONSE FUNCTION (FIXED ALL TIMEOUT ISSUES) ---
-async def get_ai_response_and_update_memory(prompt: str):
-    """FULLY OPTIMIZED VERSION with proper timeout handling and fallbacks"""
-    global current_humor_level
-    memory_collection = ml_models["memory_collection"]
-    
-    # 1. RETRIEVE RECENT CONVERSATION HISTORY
-    results = memory_collection.query(query_texts=[prompt], n_results=5)
-    conversation_history = "\n".join(results['documents'][0]) if results and results['documents'] else "No previous conversation."
-    print(f"📚 Context: {conversation_history[:100]}...")
-
-    # 2. BUILD ROUTER PROMPT
-    current_system_prompt = SYSTEM_PROMPT_TEMPLATE.format(humor_level=current_humor_level)
-    router_prompt = f"{current_system_prompt}\n\n{TOOL_PROMPT.format(conversation_history=conversation_history, user_prompt=prompt)}"
-
-    # 3. FIRST API CALL - ROUTER (Ultra-optimized settings)
-    payload = {
-        "model": MODEL_NAME, 
-        "prompt": router_prompt, 
-        "stream": False, 
+    # Router call to detect tools
+    router_payload = {
+        "model": MODEL_NAME,
+        "prompt": tool_prompt,
+        "stream": False,
         "options": {
             "temperature": 0.0,
-            "num_predict": 80,  # Reduced from 100
-            "top_k": 30,        # Reduced from 40
-            "top_p": 0.85,      # Reduced from 0.9
-            "num_thread": 8     # Use more CPU threads
+            "num_predict": 80,
+            "top_k": 30,
+            "top_p": 0.85
         }
     }
     
-    llm_router_response = ""
-    
     try:
-        # INCREASED TIMEOUT with better error handling
-        timeout = aiohttp.ClientTimeout(
-            total=60,      # Total timeout increased to 60s
-            connect=10,    # Connection timeout
-            sock_read=50   # Read timeout
-        )
-        connector = aiohttp.TCPConnector(
-            limit=10, 
-            limit_per_host=10,
-            force_close=True  # Force close connections to prevent hanging
-        )
-        
-        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-            print(f"🔹 Calling Ollama Router (timeout: 60s)...")
-            try:
-                async with session.post(OLLAMA_API_URL, json=payload) as response:
-                    if response.status == 404:
-                        return f"Ollama model '{MODEL_NAME}' not found. Run: ollama pull {MODEL_NAME}"
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(OLLAMA_API_URL, json=router_payload) as response:
+                if response.status != 200:
+                    return "Ollama error. Check if it's running."
+                
+                res_json = await response.json()
+                llm_router_response = res_json.get("response", "").strip()
+                print(f"🧠 Router response: {llm_router_response[:100]}...")
+                
+                # Parse tool call
+                tool_call = None
+                try:
+                    json_match = re.search(r'\{.*\}', llm_router_response, re.DOTALL)
+                    if json_match:
+                        json_str = json_match.group(0).strip().replace("`", "")
+                        if json_str.startswith("json"):
+                            json_str = json_str[4:].strip()
+                        json_str = json_str.replace("'", '"')
+                        tool_call = json.loads(json_str)
+                        print(f"📋 Detected tool: {tool_call.get('name')}")
+                except Exception as e:
+                    print(f"⚠️ Tool parsing error: {e}")
+                    tool_call = {"name": "no_tool", "parameters": {}}
+                
+                # Execute tool if needed
+                action_result = ""
+                if tool_call and tool_call.get("name") != "no_tool":
+                    tool_name = tool_call.get("name")
+                    tool_args = tool_call.get("parameters", {})
                     
+                    if tool_name in AVAILABLE_TOOLS:
+                        print(f"🔧 Executing tool: {tool_name}")
+                        action_function = AVAILABLE_TOOLS[tool_name]
+                        
+                        try:
+                            if asyncio.iscoroutinefunction(action_function):
+                                action_result = await action_function(**tool_args)
+                            else:
+                                action_result = await run_in_threadpool(action_function, **tool_args)
+                            
+                            print(f"✅ Tool result: {action_result[:100]}...")
+                        except Exception as e:
+                            print(f"❌ Tool execution error: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            action_result = f"Error executing {tool_name}: {str(e)}"
+                
+                # Generate natural response
+                llm_prompt = SYSTEM_PROMPT_TEMPLATE.format(
+                    humor_level=current_humor_level,
+                    conversation_history=conversation_history[:400],
+                    action_context=f"Action result: {action_result}" if action_result else "",
+                    user_prompt=prompt
+                )
+                
+                response_payload = {
+                    "model": MODEL_NAME,
+                    "prompt": llm_prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.7,
+                        "num_predict": 250,
+                        "top_k": 40,
+                        "top_p": 0.9
+                    }
+                }
+                
+                async with session.post(OLLAMA_API_URL, json=response_payload) as response:
                     if response.status != 200:
-                        error_text = await response.text()
-                        print(f"❌ Ollama API error {response.status}: {error_text}")
-                        return f"Ollama error (status {response.status}). Check if Ollama is running properly."
+                        if action_result:
+                            return clean_response_for_voice(action_result)
+                        return "Error generating response."
                     
                     res_json = await response.json()
-                    llm_router_response = res_json.get("response", "").strip()
+                    llm_response = res_json.get("response", "").strip()
                     
-                    if not llm_router_response:
-                        print("⚠️ Empty response from Ollama router")
-                        return "Ollama returned an empty response. Try restarting Ollama: 'ollama serve'"
+                    if not llm_response and action_result:
+                        llm_response = action_result
                     
-                    print(f"🧠 Router: {llm_router_response[:80]}...")
+                    final_response = clean_response_for_voice(llm_response)
                     
-            except asyncio.TimeoutError:
-                print("❌ Ollama router timeout after 60s")
-                return """Ollama is taking too long to respond. Try these steps:
-
-1. Check if Ollama is running: Open terminal and run 'ollama list'
-2. Restart Ollama: 'ollama serve' in a new terminal
-3. Test the model: 'ollama run llama3:8b "hello"'
-4. If it's still slow, your model might be loading into memory (first time takes longer)
-5. Consider using a smaller model: 'ollama pull llama3:8b-q4' (quantized version)"""
-            
-            except aiohttp.ClientConnectorError as e:
-                print(f"❌ Cannot connect to Ollama: {e}")
-                return """Cannot connect to Ollama. Please ensure:
-
-1. Ollama is installed: https://ollama.ai/download
-2. Ollama is running: Open terminal and run 'ollama serve'
-3. Check if port 11434 is available: 'netstat -an | findstr 11434' (Windows) or 'lsof -i :11434' (Mac/Linux)
-4. Try running manually: 'ollama run llama3:8b'"""
-            
-            except aiohttp.ClientPayloadError as e:
-                print(f"❌ Payload error: {e}")
-                return "Ollama connection was interrupted. Try restarting Ollama and try again."
-                
-    except Exception as e:
-        print(f"❌ Unexpected error in router: {type(e).__name__}: {e}")
-        return f"Unexpected error: {type(e).__name__}. Check if Ollama is running properly."
-
-    # 4. PARSE ROUTER RESPONSE
-    tool_call = None
-    try:
-        json_match = re.search(r'\{.*\}', llm_router_response, re.DOTALL)
-        if json_match:
-            json_str = json_match.group(0).strip().replace("`", "")
-            if json_str.startswith("json"):
-                json_str = json_str[4:].strip()
-            
-            json_str = json_str.replace("'", '"') 
-            
-            potential_tool = json.loads(json_str)
-            if "name" in potential_tool and "parameters" in potential_tool:
-                tool_call = potential_tool
-                print(f"📋 Tool: {tool_call['name']}")
-        
-        if not tool_call:
-            print(f"⚠️ No valid JSON, treating as no_tool")
-            tool_call = {"name": "no_tool", "parameters": {}}
-
-    except json.JSONDecodeError as e:
-        print(f"⚠️ JSON decode failed: {e}")
-        tool_call = {"name": "no_tool", "parameters": {}}
-    except Exception as e:
-        print(f"⚠️ Parsing error: {e}")
-        return f"An error occurred while parsing: {str(e)}"
-
-    # 5. EXECUTE TOOL OR PREPARE RESPONSE
-    try:
-        tool_name = tool_call.get("name")
-        tool_args = tool_call.get("parameters") or {}
-        
-        action_document_for_memory = f"User: {prompt}"
-        action_result = ""
-        
-        # Execute tool if needed
-        if tool_name != "no_tool" and tool_name in AVAILABLE_TOOLS:
-            print(f"🔧 Executing: {tool_name}")
-            action_function = AVAILABLE_TOOLS[tool_name]
-            
-            try:
-                if inspect.iscoroutinefunction(action_function):
-                    action_result = await action_function(**tool_args)
-                else:
-                    action_result = await run_in_threadpool(action_function, **tool_args)
-                
-                print(f"✅ Tool result: {action_result[:100]}...")
-                action_document_for_memory += f" | Action: {tool_name}({tool_args}) | Result: {action_result}"
-            except Exception as tool_error:
-                print(f"❌ Tool execution error: {tool_error}")
-                action_result = f"Tool execution failed: {str(tool_error)}"
-                action_document_for_memory += f" | Action: {tool_name} | Error: {action_result}"
-        
-        # 6. CALCULATE SMART TOKEN LIMIT
-        smart_token_limit = calculate_smart_token_limit(prompt, tool_name, action_result)
-        print(f"🧠 Smart token limit: {smart_token_limit} tokens")
-        
-        # 7. BUILD NATURAL RESPONSE PROMPT
-        natural_response_prompt = f"""{current_system_prompt}
-
-Conversation History:
-{conversation_history}
-
-{"Action Result: " + action_result if action_result else ""}
-User: {prompt}
-
-Generate a natural, conversational response. Be as detailed or concise as the situation requires.
-Your Response:"""
-
-        # 8. SECOND API CALL - RESPONSE GENERATION (WITH ADAPTIVE TIMEOUT)
-        # Adjust timeout based on expected response length
-        base_timeout = 30
-        if smart_token_limit > 500:
-            response_timeout = 90
-        elif smart_token_limit > 300:
-            response_timeout = 60
-        else:
-            response_timeout = 45
-            
-        payload = {
-            "model": MODEL_NAME, 
-            "prompt": natural_response_prompt, 
-            "stream": False, 
-            "options": {
-                "temperature": 0.7,
-                "num_predict": smart_token_limit,
-                "top_k": 40,
-                "top_p": 0.9,
-                "num_thread": 8  # Use more CPU threads
-            }
-        }
-        
-        try:
-            timeout = aiohttp.ClientTimeout(
-                total=response_timeout,
-                connect=10,
-                sock_read=response_timeout-10
-            )
-            connector = aiohttp.TCPConnector(
-                limit=10,
-                limit_per_host=10,
-                force_close=True
-            )
-            
-            async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-                print(f"🔹 Generating response (timeout: {response_timeout}s, tokens: {smart_token_limit})...")
-                try:
-                    async with session.post(OLLAMA_API_URL, json=payload) as response:
-                        if response.status != 200:
-                            error_text = await response.text()
-                            print(f"❌ Response generation failed: {error_text}")
-                            # Fallback: return tool result if available
-                            if tool_name != "no_tool" and action_result:
-                                return action_result
-                            return f"Response error (status {response.status}). Ollama might be overloaded."
-                        
-                        res_json = await response.json()
-                        natural_response = res_json.get("response", "").strip()
-                        
-                        # Handle empty response
-                        if not natural_response:
-                            print(f"⚠️ Empty response from Ollama")
-                            if tool_name != "no_tool" and action_result:
-                                return action_result
-                            return "I processed your request but couldn't generate a response. Please try again."
-                        
-                        print(f"🧠 Response: {natural_response[:80]}...")
-                        
-                        # START TTS EARLY (parallel, non-blocking)
-                        tts_task = asyncio.create_task(convert_text_to_audio_bytes(natural_response))
-                        
-                        # Save to memory (fire and forget)
-                        full_memory_doc = f"{action_document_for_memory} | AI: {natural_response}"
-                        asyncio.create_task(
-                            run_in_threadpool(
-                                memory_collection.add,
-                                documents=[full_memory_doc],
-                                ids=[datetime.now().isoformat()]
-                            )
+                    # Save to memory
+                    asyncio.create_task(
+                        run_in_threadpool(
+                            memory_collection.add,
+                            documents=[f"User: {prompt} | AI: {final_response}"],
+                            ids=[datetime.now().isoformat()]
                         )
-                        
-                        # Wait for TTS to complete (should be fast)
-                        try:
-                            await tts_task
-                        except Exception as tts_error:
-                            print(f"⚠️ TTS error (non-fatal): {tts_error}")
-                            pass
-                        
-                        return natural_response
-                        
-                except asyncio.TimeoutError:
-                    print(f"⚠️ Response generation timeout after {response_timeout}s")
-                    # Return tool result as fallback
-                    if tool_name != "no_tool" and action_result:
-                        # Save partial interaction to memory
-                        asyncio.create_task(
-                            run_in_threadpool(
-                                memory_collection.add,
-                                documents=[f"{action_document_for_memory} | AI: [Timeout]"],
-                                ids=[datetime.now().isoformat()]
-                            )
-                        )
-                        return action_result
-                    return """Ollama took too long generating a response. This usually means:
-
-1. The model is processing a complex request
-2. Your computer is under heavy load
-3. The model needs more RAM
-
-Try: Restart Ollama or use a simpler query."""
-                
-                except aiohttp.ClientPayloadError as e:
-                    print(f"❌ Payload error during response: {e}")
-                    if tool_name != "no_tool" and action_result:
-                        return action_result
-                    return "Connection interrupted. Please try again."
+                    )
                     
-        except Exception as e:
-            print(f"⚠️ Response generation error: {type(e).__name__}: {e}")
-            if tool_name != "no_tool" and action_result:
-                return action_result
-            return f"Error generating response: {type(e).__name__}"
-
+                    return final_response
+                
     except Exception as e:
-        print(f"⚠️ Execution error: {type(e).__name__}: {e}")
+        print(f"❌ Error in standard path: {type(e).__name__}: {e}")
         import traceback
         traceback.print_exc()
-        memory_collection.add(
-            documents=[f"User: {prompt} | AI Error: {str(e)}"],
-            ids=[datetime.now().isoformat()]
-        )
-        return f"An error occurred: {str(e)}"
+        return "An error occurred while processing your request."
 
 
-# --- OPTIONAL: Add a health check endpoint ---
-@app.get("/health")
-async def health_check():
-    """Check if Ollama is responding"""
+# --- OPTIMIZED VOICE CHAT ENDPOINT ---
+@app.post("/voice-chat")
+async def voice_chat(audio: UploadFile = File(...)):
+    """OPTIMIZED: In-memory processing + fast-path routing"""
+    whisper_model = ml_models["whisper_model"]
+    temp_file_path = None
+    
     try:
-        timeout = aiohttp.ClientTimeout(total=5)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get("http://localhost:11434/api/tags") as response:
-                if response.status == 200:
-                    data = await response.json()
-                    models = [m['name'] for m in data.get('models', [])]
-                    return {
-                        "ollama_status": "running",
-                        "models": models,
-                        "model_in_use": MODEL_NAME,
-                        "model_available": MODEL_NAME in models
-                    }
-                else:
-                    return {"ollama_status": "error", "message": f"Status {response.status}"}
-    except asyncio.TimeoutError:
-        return {"ollama_status": "timeout", "message": "Ollama not responding"}
-    except aiohttp.ClientConnectorError:
-        return {"ollama_status": "not_running", "message": "Cannot connect to Ollama on port 11434"}
+        # Read audio into memory
+        content = await audio.read()
+        
+        if len(content) == 0:
+            raise HTTPException(status_code=400, detail="Empty audio file")
+        
+        print(f"📁 Audio received: {len(content)} bytes")
+        
+        # Write to temp file (Whisper needs file path)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
+            temp_file.write(content)
+            temp_file_path = temp_file.name
+        
+        # Transcribe
+        try:
+            transcription_result = await run_in_threadpool(
+                whisper_model.transcribe,
+                temp_file_path,
+                fp16=torch.cuda.is_available(),
+                language="en",
+                task="transcribe"
+            )
+            user_prompt = transcription_result["text"].strip()
+            print(f"🗣️ User: {user_prompt}")
+        except RuntimeError as e:
+            print(f"❌ Whisper failed: {e}")
+            if temp_file_path and os.path.exists(temp_file_path):
+                os.remove(temp_file_path)
+            raise HTTPException(status_code=400, detail=f"Transcription failed: {str(e)}")
+            
+    except HTTPException:
+        raise
     except Exception as e:
-        return {"ollama_status": "error", "message": str(e)}
+        print(f"❌ Error processing audio: {e}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+    finally:
+        # Clean up temp file
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+            except:
+                pass
+    
+    if not user_prompt:
+        response_text = "Sorry, I didn't catch that."
+        audio_bytes = await convert_text_to_audio_bytes(response_text)
+    else:
+        # Get AI response (uses fast-path if applicable)
+        response_text = await get_ai_response_hybrid(user_prompt)
+        
+        # Check cache first
+        cache_key = response_text[:100]
+        if cache_key in audio_cache:
+            audio_bytes = audio_cache[cache_key]
+        else:
+            audio_bytes = await convert_text_to_audio_bytes(response_text)
+    
+    print(f"🤖 Response: {response_text[:60]}...")
+    
+    if ml_models.get("piper_voice"):
+        return Response(content=audio_bytes, media_type="audio/wav")
+    else:
+        return Response(content=audio_bytes, media_type="audio/mpeg")
 
 
-# --- ALSO ADD THIS UTILITY FUNCTION ---
-async def check_ollama_status():
-    """Quick check if Ollama is responsive"""
-    try:
-        timeout = aiohttp.ClientTimeout(total=3)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get("http://localhost:11434/api/tags") as response:
-                return response.status == 200
-    except:
-        return False
-# --- FastAPI Endpoints ---
-
+# --- CHAT HISTORY ENDPOINT ---
 @app.get("/chat-history")
 async def get_chat_history():
     try:
@@ -1378,88 +1771,49 @@ async def get_chat_history():
     except Exception as e:
         print(f"❌ Error fetching chat history: {e}")
         raise HTTPException(status_code=500, detail="Could not retrieve chat history.")
-    
-@app.post("/voice-chat")
-async def voice_chat(audio: UploadFile = File(...)):
-    """OPTIMIZED: Parallel transcription + faster response"""
-    whisper_model = ml_models["whisper_model"]
-    temp_file_path = None
-    
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
-            content = await audio.read()
-            
-            if len(content) == 0:
-                raise HTTPException(status_code=400, detail="Empty audio file")
-            
-            temp_file.write(content)
-            temp_file_path = temp_file.name
-        
-        print(f"📁 Audio: {len(content)} bytes")
-        
-        if not os.path.exists(temp_file_path):
-            raise HTTPException(status_code=500, detail="Failed to save audio file")
-        
-        file_size = os.path.getsize(temp_file_path)
-        if file_size == 0:
-            raise HTTPException(status_code=400, detail="Audio file is empty")
-        
-        print(f"🎤 Fast transcription...")
-        
-        try:
-            transcription_result = await run_in_threadpool(
-                whisper_model.transcribe,
-                temp_file_path,
-                fp16=torch.cuda.is_available(),
-                language="en",
-                task="transcribe"
-            )
-            user_prompt = transcription_result["text"].strip()
-            print(f"🗣️ User: {user_prompt}")
-        except RuntimeError as e:
-            print(f"❌ Whisper failed: {e}")
-            if temp_file_path and os.path.exists(temp_file_path):
-                os.remove(temp_file_path)
-            raise HTTPException(status_code=400, detail=f"Transcription failed: {str(e)}")
-            
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"❌ Error: {e}")
-        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
-    finally:
-        if temp_file_path and os.path.exists(temp_file_path):
-            try:
-                os.remove(temp_file_path)
-            except:
-                pass
-    
-    if not user_prompt:
-        response_text = "Sorry, I didn't catch that."
-        audio_bytes = await convert_text_to_audio_bytes(response_text)
-    else:
-        # Get response (TTS runs in parallel)
-        response_text = await get_ai_response_and_update_memory(user_prompt)
-        
-        # Check cache
-        cache_key = response_text[:100]
-        if cache_key in audio_cache:
-            audio_bytes = audio_cache[cache_key]
-        else:
-            audio_bytes = await convert_text_to_audio_bytes(response_text)
-    
-    print(f"🤖 Response: {response_text[:60]}...")
-    
-    if ml_models.get("piper_voice"):
-        return Response(content=audio_bytes, media_type="audio/wav")
-    else:
-        return Response(content=audio_bytes, media_type="audio/mpeg")
 
+
+# --- HEALTH CHECK ENDPOINT ---
+@app.get("/health")
+async def health_check():
+    """Check if Ollama is responding"""
+    try:
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get("http://localhost:11434/api/tags") as response:
+                if response.status == 200:
+                    data = await response.json()
+                    models = [m['name'] for m in data.get('models', [])]
+                    return {
+                        "ollama_status": "running",
+                        "models": models,
+                        "model_in_use": MODEL_NAME,
+                        "model_available": MODEL_NAME in models,
+                        "fast_path": "enabled"
+                    }
+                else:
+                    return {"ollama_status": "error", "message": f"Status {response.status}"}
+    except asyncio.TimeoutError:
+        return {"ollama_status": "timeout", "message": "Ollama not responding"}
+    except aiohttp.ClientConnectorError:
+        return {"ollama_status": "not_running", "message": "Cannot connect to Ollama on port 11434"}
+    except Exception as e:
+        return {"ollama_status": "error", "message": str(e)}
+
+
+# --- ROOT ENDPOINT ---
 @app.get("/")
 async def root():
     piper_status = "✅ Active" if ml_models.get("piper_voice") else "⚠️ Not loaded (using gTTS)"
     return {
-        "status": "MURPH AI Backend Running",
+        "status": "MURPH AI Backend Running (OPTIMIZED)",
+        "version": "2.0 - Fast-Path Edition",
         "voice_engine": piper_status,
-        "humor_level": current_humor_level
+        "humor_level": current_humor_level,
+        "optimizations": {
+            "fast_path_detection": "enabled",
+            "single_shot_llm": "enabled",
+            "in_memory_processing": "enabled",
+            "parallel_tts": "enabled"
+        }
     }
