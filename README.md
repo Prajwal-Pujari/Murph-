@@ -586,6 +586,6 @@ MURPH is built upon several outstanding open-source projects:
 
 ---
 
-**Version**: 1.0.0  
-**Last Updated**: November 2025  
+**Version**: 1.0.1  
+**Last Updated**: December 2025  
 **Status**: Active Development
